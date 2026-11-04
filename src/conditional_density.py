@@ -23,6 +23,7 @@ def canonical_kpoints(exciton_kpoints, exciton_mesh):
     exciton_exact_kpoints = np.rint(exciton_kpoints * exciton_mesh) / exciton_mesh
     if not np.allclose(exciton_exact_kpoints, exciton_kpoints, atol=1e-10, rtol=0):
         raise ValueError('Only Gamma-centered uniform meshes are supported')
+    # Reciprocal-lattice-equivalent k points must count as the same mesh point.
     exciton_indices = np.rint(exciton_exact_kpoints * exciton_mesh).astype(int) % exciton_mesh
     if len(np.unique(exciton_indices, axis=0)) != len(exciton_indices):
         raise ValueError('Duplicate/missing k points')
@@ -53,6 +54,7 @@ def hole_value(orbital_grid, orbital_kpoint, hole_fractional):
 def extend_amplitude(exciton_partial, exciton_kpoints, exciton_mesh):
     """Sum Bloch-translated amplitudes, not already-squared primitive densities."""
     orbital_shape = np.asarray(exciton_partial.shape[1:])
+    # A complete centered BvK supercell retains the interference between k points.
     bvk_start = -(exciton_mesh // 2)
     bvk_amplitude = np.empty(tuple(orbital_shape * exciton_mesh), dtype=complex)
     for bvk_index in itertools.product(*(range(int(n)) for n in exciton_mesh)):
@@ -63,36 +65,42 @@ def extend_amplitude(exciton_partial, exciton_kpoints, exciton_mesh):
     return bvk_amplitude, bvk_start
 
 
+def cube_origin(orbital_path):
+    """Read the standard FHI-aims cube origin in Angstrom without its grid."""
+    from ase.units import Bohr
+    with orbital_path.open() as orbital_stream:
+        next(orbital_stream)
+        next(orbital_stream)
+        return np.asarray(next(orbital_stream).split()[1:4], dtype=float) * Bohr
+
+
 class OrbitalCubes:
     """Check grid/geometry compatibility while reading one orbital at a time."""
     def __init__(self, directory):
         self.directory = directory
         self.reference = None
         self.hashes = {}
-        orbital_manifest = directory.parent / 'cube_requests.json'
-        self.orbital_paths = None
-        if orbital_manifest.exists():
-            orbital_requests = json.loads(orbital_manifest.read_text())
-            self.orbital_paths = {}
-            for orbital_request in orbital_requests:
-                if orbital_request['axis'] is None:
-                    orbital_key = (orbital_request['kpoint'], orbital_request['band'], orbital_request['kind'])
-                    if orbital_key in self.orbital_paths:
-                        raise ValueError(f'Duplicate primitive orbital in manifest: {orbital_key}')
-                    self.orbital_paths[orbital_key] = directory / orbital_request['filename']
+
+    def paths(self, k_index, band, orbital_kind):
+        orbital_paths = sorted(self.directory.glob(
+            f'cube_*_{orbital_kind}_{band:05d}_spin_1_k_point_{k_index+1:04d}.cube'))
+        if not orbital_paths:
+            raise FileNotFoundError(f'Missing cube for k={k_index+1}, band={band}, {orbital_kind}')
+        if self.reference is None:
+            # Generated request numbers place primitive cubes before translated copies.
+            return orbital_paths[:1]
+        # Translated validation cubes must not replace the primitive orbital.
+        primitive_paths = []
+        for orbital_path in orbital_paths:
+            if np.allclose(cube_origin(orbital_path), self.reference['origin'], atol=1e-6, rtol=0):
+                primitive_paths.append(orbital_path)
+        return primitive_paths
 
     def read(self, k_index, band):
         from ase.io.cube import read_cube
         orbital_parts = []
         for orbital_kind in ('eigenstate', 'eigenstate_imag'):
-            if self.orbital_paths is not None:
-                # Translation-validation cubes have the same band/k suffix;
-                # only axis=None requests represent the primitive orbitals.
-                orbital_path = self.orbital_paths.get((k_index+1, band, orbital_kind))
-                orbital_paths = [] if orbital_path is None else [orbital_path]
-            else:
-                orbital_paths = list(self.directory.glob(
-                    f'cube_*_{orbital_kind}_{band:05d}_spin_1_k_point_{k_index+1:04d}.cube'))
+            orbital_paths = self.paths(k_index, band, orbital_kind)
             if len(orbital_paths) != 1:
                 raise ValueError(f'Expected exactly one cube for k={k_index+1}, band={band}, {orbital_kind}')
             orbital_path = orbital_paths[0]
@@ -101,6 +109,8 @@ class OrbitalCubes:
                 orbital_cube = read_cube(orbital_stream)
             if self.reference is None:
                 self.reference = orbital_cube
+                if len(self.paths(k_index, band, orbital_kind)) != 1:
+                    raise ValueError("Duplicate primitive orbital cubes")
             orbital_reference = self.reference
             if (orbital_cube['data'].shape != orbital_reference['data'].shape
                     or not np.isfinite(orbital_cube['data']).all()
@@ -140,25 +150,19 @@ def select_hole(primitive_atoms, hole_coordinates=None, hole_atom=None):
 
 
 def calculate(args):
-    if args.output.exists():
-        raise ValueError('Output directory already exists; choose a new path to preserve previous results')
-    orbital_validation = json.loads(args.validation.read_text())
-    if not (orbital_validation.get('complex_cubes_valid') is True
-            and orbital_validation.get('existing_BSE_gauge_compatible') is True):
-        raise ValueError('A positive complex-cube and BSE-gauge validation report is required')
-    if not orbital_validation.get('source_hashes'):
-        raise ValueError('Orbital validation report has no source hashes')
-    for source_name, source_hash in orbital_validation['source_hashes'].items():
-        source_path = args.validation.parent / source_name
-        if hashlib.sha256(source_path.read_bytes()).hexdigest() != source_hash:
-            raise ValueError(f'Producer changed after validation: {source_name}')
     with np.load(args.excitons, allow_pickle=False) as exciton_archive:
         if str(exciton_archive['source']) != 'LibBSE TDA' or str(exciton_archive['wavefunction_gauge']) != 'native':
             raise ValueError('Only scalar native-gauge LibBSE TDA archives are supported')
         if args.state < 0 or args.state >= len(exciton_archive['coefficients']):
             raise ValueError('State index is out of range (zero-based)')
-        if 'provenance' in exciton_archive:
-            exciton_provenance = json.loads(str(exciton_archive['provenance']))
+        if 'source_paths' in exciton_archive or 'provenance' in exciton_archive:
+            if 'source_paths' in exciton_archive:
+                exciton_provenance = dict(zip(exciton_archive['source_paths'].tolist(),
+                                             exciton_archive['source_sha256'].tolist()))
+            else:
+                # Read existing archives; new archives use native NPZ fields.
+                exciton_provenance = json.loads(str(exciton_archive['provenance']))
+            # Hashes detect changed inputs; they do not independently prove KS/BSE phase agreement.
             for source_name, source_hash in exciton_provenance.items():
                 if hashlib.sha256(Path(source_name).read_bytes()).hexdigest() != source_hash:
                     raise ValueError(f'BSE source changed after import: {source_name}')
@@ -185,6 +189,7 @@ def calculate(args):
     primitive_origin = orbital_reader.reference['origin']
     hole_cartesian, hole_selection = select_hole(
         orbital_reader.reference['atoms'], args.hole, args.hole_atom)
+    # Interpolation coordinates are relative to the cube origin, not the crystal origin.
     hole_fractional = (hole_cartesian - primitive_origin) @ np.linalg.inv(primitive_cell)
     orbital_shape = np.asarray(first_orbital.shape)
     exciton_partial = np.zeros((nk, *orbital_shape), dtype=complex)
@@ -195,14 +200,12 @@ def calculate(args):
             valence_orbital = (first_orbital if k_index == 0 and v_index == 0
                               else orbital_reader.read(k_index, valence_start + v_index))
             hole_orbitals[k_index, v_index] = hole_value(valence_orbital, exciton_kpoints[k_index], hole_fractional)
+        # Psi_S(re,rh) = sum_kvc A_S(k,v,c) psi_c,k(re) conjugate(psi_v,k(rh)).
+        # Contract valence bands first, preserving all complex interference terms.
         conduction_weights = exciton_coefficients[k_index].T @ hole_orbitals[k_index].conj()
         for c_index in range(nc):
             conduction_orbital = orbital_reader.read(k_index, conduction_start + c_index)
             exciton_partial[k_index] += conduction_weights[c_index] * conduction_orbital
-    if 'orbital_sha256' in orbital_validation:
-        for orbital_name, orbital_hash in orbital_reader.hashes.items():
-            if orbital_validation['orbital_sha256'].get(orbital_name) != orbital_hash:
-                raise ValueError(f'Orbital changed after validation: {orbital_name}')
     bvk_amplitude, bvk_start = extend_amplitude(exciton_partial, exciton_kpoints, exciton_mesh)
     voxel_volume = abs(np.linalg.det(primitive_cell)) / np.prod(orbital_shape)
     cond_density = abs(bvk_amplitude)**2
@@ -213,6 +216,7 @@ def calculate(args):
     parseval_integral = float(nk * np.sum(abs(exciton_partial)**2) * voxel_volume)
     if not np.isclose(raw_integral, parseval_integral, rtol=1e-11, atol=0):
         raise ValueError('BvK/Parseval check failed')
+    # Normalize over electron coordinates at this fixed hole; keep its raw weight separately.
     cond_density /= raw_integral
     cond_origin = primitive_origin + bvk_start @ primitive_cell
     cond_cell = primitive_cell * exciton_mesh[:, None]
@@ -229,24 +233,31 @@ def calculate(args):
                         normalized_integral=float(cond_density.sum()*voxel_volume),
                         parseval_relative_error=abs(raw_integral/parseval_integral-1),
                         excitons_sha256=hashlib.sha256(args.excitons.read_bytes()).hexdigest(),
-                        validation_sha256=hashlib.sha256(args.validation.read_bytes()).hexdigest(),
                         script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                         orbital_sha256=orbital_reader.hashes,
                         bse_source_hashes=exciton_provenance,
-                        producer_source_hashes=orbital_validation['source_hashes'],
-                        gauge_evidence='User-supplied report; this run does not recompute AO-gauge compatibility',
+                        gauge_evidence='Source hashes checked; AO-gauge compatibility is not independently verified',
                         limitations='Scalar TDA, complete Gamma-centered mesh, spin-1 cubes; no physical convergence claim')
     cond_optional_arrays = {}
     if getattr(args, 'save_wavefunction', False):
         cond_optional_arrays['amplitude'] = bvk_amplitude / np.sqrt(raw_integral)
-    args.output.mkdir(parents=True)
+    # Native NPZ fields keep metadata readable with allow_pickle=False and no JSON records.
+    cond_metadata = {key: value for key, value in cond_summary.items()
+                     if key not in ('state', 'hole_angstrom', 'hole_selection',
+                                    'orbital_sha256', 'bse_source_hashes')}
+    cond_metadata.update(hole_selection_mode=hole_selection['mode'],
+                         hole_atom_index=hole_selection.get('atom_index_one_based', 0),
+                         orbital_paths=list(orbital_reader.hashes),
+                         orbital_sha256=list(orbital_reader.hashes.values()),
+                         source_paths=list(exciton_provenance),
+                         source_sha256=list(exciton_provenance.values()))
+    args.output.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output/'conditional_density.npz', density=cond_density,
                         origin_angstrom=cond_origin, cell_angstrom=cond_cell,
                         hole_angstrom=hole_cartesian, hole_orbital_values=hole_orbitals,
                         kpoints=exciton_kpoints, atom_positions_angstrom=cond_atoms.positions,
                         atom_numbers=cond_atoms.numbers, state=args.state,
-                        hole_selection_json=json.dumps(hole_selection),
-                        summary_json=json.dumps(cond_summary), **cond_optional_arrays)
+                        **cond_metadata, **cond_optional_arrays)
     print(f'Wrote {args.output}: integral={cond_summary["normalized_integral"]:.15g}, '
           f'Parseval error={cond_summary["parseval_relative_error"]:.3g}')
 
@@ -255,7 +266,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--excitons', type=Path, required=True)
     parser.add_argument('--orbitals', type=Path, required=True)
-    parser.add_argument('--validation', type=Path, required=True, help='Prior orbital/gauge validation JSON')
     parser.add_argument('--state', type=int, default=0)
     hole_group = parser.add_mutually_exclusive_group(required=True)
     hole_group.add_argument('--hole', type=float, nargs=3, help='Cartesian Angstrom coordinates')

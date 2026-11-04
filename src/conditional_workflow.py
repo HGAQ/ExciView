@@ -1,4 +1,3 @@
-import json
 import hashlib
 import tempfile
 from pathlib import Path
@@ -12,8 +11,7 @@ from tools.libbse_to_exciview import convert
 
 def prepare_inputs(geometry, output, kmesh, nv, nc, v_start, c_start, cube_grid, cube_origin):
     geometry = Path(geometry); output = Path(output)
-    for filename in ('cube_cond_snippet.in', 'cube_requests.json', 'conditional_setup.json'):
-        if (output/filename).exists(): raise ValueError(f'Output file already exists: {output/filename}')
+    # Geometry and cube coordinates use Angstrom; the grid spans one primitive cell.
     primitive_atoms = read(geometry, format='aims')
     primitive_cell = primitive_atoms.cell.array
     if len(primitive_cell) != 3 or primitive_atoms.get_volume() <= 0:
@@ -35,6 +33,7 @@ def prepare_inputs(geometry, output, kmesh, nv, nc, v_start, c_start, cube_grid,
         for band in range(v_start, c_start+nc):
             for kind in ('eigenstate', 'eigenstate_imag', 'eigenstate_density'):
                 cube_requests.append(dict(kpoint=kpoint, band=band, kind=kind, axis=None))
+    # Extra translated cubes test Bloch phases without a separate SCF calculation.
     translation_kpoints = sorted({min(2, nk), (nk+1)//2})
     for kpoint in translation_kpoints:
         for axis in range(3):
@@ -47,17 +46,17 @@ def prepare_inputs(geometry, output, kmesh, nv, nc, v_start, c_start, cube_grid,
         if request['axis'] is not None: request_origin += primitive_cell[request['axis']]
         cube_lines.append(f"\noutput cube {request['kind']} {request['band']}\n cube kpoint {request['kpoint']}\n cube filename {filename}\n")
         cube_lines.append(' cube origin '+' '.join(f'{coordinate:.12f}' for coordinate in request_origin)+'\n')
+        # FHI-aims cube edges are voxel steps, not full lattice vectors.
         for n, edge in zip(cube_grid, primitive_cell):
             cube_lines.append(f' cube edge {n} '+' '.join(f'{coordinate:.12f}' for coordinate in edge/n)+'\n')
     output.mkdir(parents=True, exist_ok=True)
+    # Reuse the directory and replace only this workflow's generated input file.
     (output/'cube_cond_snippet.in').write_text(''.join(cube_lines))
-    (output/'cube_requests.json').write_text(json.dumps(cube_requests, indent=2)+'\n')
     setup = dict(kmesh=list(kmesh), grid=list(cube_grid), v_start=v_start, c_start=c_start,
                  nv=nv, nc=nc, atom_numbers=primitive_atoms.numbers.tolist(),
                  translation_kpoints=translation_kpoints, cube_count=len(cube_requests),
                  tda_dimension=nk*nv*nc, source_geometry=str(geometry.resolve()),
                  source_geometry_sha256=hashlib.sha256(geometry.read_bytes()).hexdigest())
-    (output/'conditional_setup.json').write_text(json.dumps(setup, indent=2)+'\n')
     print(f'Success! Generated {len(cube_requests)} cube requests in {output}/cube_cond_snippet.in')
     print('Use the compatible scalar FHI-aims producer with off-Gamma real/imaginary cube support.')
     print('Add the snippet to control.in before the species section; use the requested SCF k grid.')
@@ -81,13 +80,11 @@ def analyze_cond():
     fname = Path(input('BSE directory / LibBSE NPZ filename: ').strip()).resolve()
     state_idx = int(input('State Index: '))
     orbitals = Path(input('Orbital cube directory: ').strip()).resolve()
-    validation = Path(input('Orbital validation filename: ').strip()).resolve()
     output = Path(input('Output directory: ').strip()).resolve()
-    if output.exists(): raise ValueError('Output directory already exists.')
     if fname.is_dir():
         v_start = int(input('Abs Valence ID: ')); c_start = int(input('Abs Conduction ID: '))
-    print('\n[Fixed Hole Position]')
-    hole_atom_text = input('Hole atom (1-based, blank for coordinates): ').strip()
+    # Atom indices follow the cube geometry (one-based); coordinates are Cartesian.
+    hole_atom_text = input('Select fixed hole atom index (1-based; Enter to specify coordinates): ').strip()
     hole_atom = int(hole_atom_text) if hole_atom_text else None
     hole_coordinates = None
     if hole_atom is None:
@@ -100,7 +97,7 @@ def analyze_cond():
             convert(fname, cond_archive_path, v_start, c_start)
         else:
             cond_archive_path = fname
-        calculate(SimpleNamespace(excitons=cond_archive_path, orbitals=orbitals, validation=validation,
+        calculate(SimpleNamespace(excitons=cond_archive_path, orbitals=orbitals,
                                  state=state_idx, hole=hole_coordinates, hole_atom=hole_atom,
                                  output=output, save_wavefunction=False))
 

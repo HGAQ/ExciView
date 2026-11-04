@@ -101,7 +101,7 @@ class ExciViewTests(unittest.TestCase):
         with np.load('embedded.npz', allow_pickle=False) as z:
             np.testing.assert_allclose(z['mulliken_populations'][:,:,0,0],
                                        [[.1,.2,.3],[.3,.4,.5]])
-            self.assertIn('bandmlk1001.out', str(z['provenance']))
+            self.assertIn('bandmlk1001.out', str(z['source_paths']))
         with self.assertRaisesRegex(ValueError, 'No bandmlk'):
             convert('.', 'missing.npz', 1, 2, mulliken_dir='absent')
         Path('output/oscillator_strength_singlet_tda.dat').write_text('0 5.4422772491976 0 0 0 0\n')

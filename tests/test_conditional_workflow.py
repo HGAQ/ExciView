@@ -1,7 +1,6 @@
 import contextlib
 import hashlib
 import io
-import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -37,12 +36,8 @@ class ConditionalWorkflowTests(unittest.TestCase):
                     with (self.aims/filename).open('w') as stream:
                         write_cube(stream,self.atoms,data=orbital_part,origin=self.origin)
                     self.cube_requests.append(dict(kpoint=kpoint,band=band,kind=kind,axis=None,filename=filename))
-        (self.run/'cube_requests.json').write_text(json.dumps(self.cube_requests))
         (self.aims/'bz_sampling_out').write_text('2 1 1\n2 2\n1 .5 0 0 0\n2 .5 .5 0 0\n')
         self.bz_hash=hashlib.sha256((self.aims/'bz_sampling_out').read_bytes()).hexdigest()
-        self.validation=dict(complex_cubes_valid=True,existing_BSE_gauge_compatible=True,
-                             source_hashes={'aims/bz_sampling_out':self.bz_hash})
-        (self.run/'orbital_validation.json').write_text(json.dumps(self.validation))
         self.save_archive()
 
     def tearDown(self):
@@ -51,11 +46,11 @@ class ConditionalWorkflowTests(unittest.TestCase):
     def save_archive(self):
         np.savez(self.run/'excitons.npz',coefficients=self.coefficients,kpoints=self.kpoints,
                  kmesh=[2,1,1],v_start=1,c_start=2,source='LibBSE TDA',wavefunction_gauge='native',
-                 provenance=json.dumps({str(self.aims/'bz_sampling_out'):self.bz_hash}))
+                 source_paths=[str(self.aims/'bz_sampling_out')], source_sha256=[self.bz_hash])
 
     def arguments(self, output='density'):
         return SimpleNamespace(excitons=self.run/'excitons.npz',orbitals=self.aims,
-                               validation=self.run/'orbital_validation.json',state=0,
+                               state=0,
                                hole=self.origin+[.01,.01,.01],hole_atom=None,output=self.run/output,
                                no_plot=True,save_wavefunction=False)
 
@@ -65,26 +60,23 @@ class ConditionalWorkflowTests(unittest.TestCase):
         output=self.run/'generated'
         answers=['6',str(geometry),str(output),'2','1','1','1','1','1','2','3 4 5','-.2 -.3 -.4']
         with patch('builtins.input',side_effect=answers),contextlib.redirect_stdout(io.StringIO()): b.main()
-        self.assertEqual({path.name for path in output.iterdir()}, {'cube_cond_snippet.in','cube_requests.json','conditional_setup.json'})
+        self.assertEqual({path.name for path in output.iterdir()}, {'cube_cond_snippet.in'})
         snippet=(output/'cube_cond_snippet.in').read_text()
-        requests=json.loads((output/'cube_requests.json').read_text())
-        self.assertEqual(len(requests),24)
         self.assertEqual(snippet.count('output cube '),24)
         self.assertEqual(snippet.count(' cube edge '),72)
-        self.assertEqual(len({request['filename'] for request in requests}),24)
-        self.assertEqual(len([request for request in requests if request['axis'] is None]),12)
-        with self.assertRaisesRegex(ValueError,'already exists'):
-            prepare_inputs(geometry,output,[2,1,1],1,1,1,2,[3,4,5],self.origin)
+        prepare_inputs(geometry,output,[2,1,1],1,1,1,2,[3,4,5],self.origin)
+        self.assertEqual((output/'cube_cond_snippet.in').read_text(),snippet)
 
     def test_menu7_independent_bvk_sum_and_normalization(self):
         output=self.run/'menu7'
-        answers=['7',str(self.run/'excitons.npz'),'0',str(self.aims),str(self.run/'orbital_validation.json'),str(output),'',*map(str,self.origin+[.01,.01,.01])]
+        answers=['7',str(self.run/'excitons.npz'),'0',str(self.aims),str(output),'',*map(str,self.origin+[.01,.01,.01])]
         with patch('builtins.input',side_effect=answers),contextlib.redirect_stdout(io.StringIO()): b.main()
         self.assertEqual({path.name for path in output.iterdir()}, {'conditional_density.npz'})
         with np.load(output/'conditional_density.npz') as archive:
             calculated_density=archive['density']
             density_cell=archive['cell_angstrom']
-            cond_summary=json.loads(str(archive['summary_json']))
+            cond_parseval_error=float(archive['parseval_relative_error'])
+            self.assertFalse(any('json' in field for field in archive.files))
         expected_amplitudes=[]
         for translation in (-1,0):
             expected_amplitudes.append(sum(self.coefficients[0,k,0,0]*self.primitive_orbitals[k+1,1][0,0,0].conjugate()*self.primitive_orbitals[k+1,2]*np.exp(2j*np.pi*self.kpoints[k,0]*translation) for k in range(2)))
@@ -93,7 +85,18 @@ class ConditionalWorkflowTests(unittest.TestCase):
         expected_density/=expected_density.sum()*voxel_volume
         np.testing.assert_allclose(calculated_density,expected_density,rtol=1e-12,atol=1e-12)
         self.assertAlmostEqual(calculated_density.sum()*voxel_volume,1)
-        self.assertLess(cond_summary['parseval_relative_error'],1e-12)
+        self.assertLess(cond_parseval_error,1e-12)
+
+    def test_existing_output_directory_and_file(self):
+        output=self.run/'existing'
+        output.mkdir()
+        (output/'keep.txt').write_text('keep')
+        (output/'conditional_density.npz').write_text('old output')
+        calculate(self.arguments('existing'))
+        self.assertEqual((output/'keep.txt').read_text(),'keep')
+        with np.load(output/'conditional_density.npz') as density_archive:
+            self.assertAlmostEqual(float(density_archive['normalized_integral']),1)
+        self.assertEqual(list(self.run.rglob('*.json')), [])
 
     def test_phase_covariance(self):
         calculate(self.arguments('before'))
@@ -118,11 +121,13 @@ class ConditionalWorkflowTests(unittest.TestCase):
         (self.aims/self.cube_requests[1]['filename']).unlink()
         with self.assertRaises(FileNotFoundError): calculate(self.arguments())
         (self.aims/'bz_sampling_out').write_text('changed')
-        with self.assertRaisesRegex(ValueError,'Producer changed'): calculate(self.arguments())
+        with self.assertRaisesRegex(ValueError,'BSE source changed'): calculate(self.arguments())
 
-    def test_manifest_excludes_translation_cubes(self):
+    def test_reader_excludes_translation_cubes_without_manifest(self):
         extra_cube=self.aims/'cube_999_eigenstate_00001_spin_1_k_point_0001.cube'
-        extra_cube.write_text('not a primitive cube')
+        with extra_cube.open('w') as stream:
+            write_cube(stream,self.atoms,data=self.primitive_orbitals[1,1],
+                       origin=self.origin+self.atoms.cell.array[0])
         orbital_reader=OrbitalCubes(self.aims)
         np.testing.assert_allclose(orbital_reader.read(0,1),self.primitive_orbitals[1,1])
 
@@ -131,9 +136,21 @@ class ConditionalWorkflowTests(unittest.TestCase):
         write(geometry,self.atoms,format='aims')
         generated=self.run/'generated'
         prepare_inputs(geometry,generated,[2,1,1],1,1,1,2,[3,4,5],self.origin)
-        for filename in ('conditional_setup.json','cube_requests.json'):
-            (self.run/filename).write_text((generated/filename).read_text())
-        cube_requests=json.loads((self.run/'cube_requests.json').read_text())
+        cube_requests=[]
+        for cube_section in (generated/'cube_cond_snippet.in').read_text().split('output cube ')[1:]:
+            cube_lines=cube_section.splitlines()
+            cube_kind,cube_band=cube_lines[0].split()
+            cube_kpoint=int(cube_lines[1].split()[2])
+            cube_filename=cube_lines[2].split()[2]
+            cube_origin=np.array([float(coordinate) for coordinate in cube_lines[3].split()[2:]])
+            cube_axis=None
+            for axis in range(3):
+                if np.allclose(cube_origin,self.origin+self.atoms.cell.array[axis]):
+                    cube_axis=axis
+            cube_requests.append(dict(kind=cube_kind,band=int(cube_band),kpoint=cube_kpoint,
+                                      filename=cube_filename,axis=cube_axis))
+        for orbital_path in self.aims.glob('*.cube'):
+            orbital_path.unlink()
         for request in cube_requests:
             orbital_amplitude=self.primitive_orbitals[request['kpoint'],request['band']]
             cube_origin=self.origin.copy()
@@ -151,8 +168,8 @@ class ConditionalWorkflowTests(unittest.TestCase):
         orbital_path=self.aims/cube_requests[1]['filename']
         with orbital_path.open('w') as stream:
             write_cube(stream,self.atoms,data=np.ones((3,4,5)),origin=self.origin)
-        with self.assertRaisesRegex(ValueError,'Orbital changed'): calculate(self.arguments('stale'))
         with self.assertRaises(ValueError): validate(self.run)
+        self.assertEqual(list(self.run.rglob('*.json')), [])
 
     def test_reject_incomplete_mesh(self):
         with self.assertRaises(ValueError): canonical_kpoints(self.kpoints,np.array([3,1,1]))

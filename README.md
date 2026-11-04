@@ -65,8 +65,8 @@ remain in `BSE_tools.py`.
 
 Menu 6 requires geometry.in, an output directory, Kx/Ky/Kz, Nv/Nc, one-based
 valence/conduction start bands, the primitive cube grid and its origin (Angstrom).
-It generates **only** `cube_cond_snippet.in`, `cube_requests.json` and
-`conditional_setup.json`. It does not generate GW/BSE inputs or submit jobs.
+It generates only `cube_cond_snippet.in`. Existing output directories are accepted;
+the generated file is replaced when rerun. It does not generate GW/BSE inputs or submit jobs.
 Use a neutral, non-spin-polarized scalar calculation and a complete Gamma-centered
 SCF mesh. Add the snippet before the species section of control.in; remove any
 old cube requests so that request order and filenames remain unambiguous.
@@ -80,33 +80,38 @@ a separate SCF can rotate phases and degenerate subspaces.
 
 For h-BN 7×7×7, enter Nv=4, Nc=4, v_start=9, c_start=13, cube grid `32 32 64`
 and origin `-0.2 -0.2 -0.2`. This generates 8244 requests matching the existing
-h-BN producer manifest. Keep the JSON files in the run root and the AIMS outputs
-in its `aims/` subdirectory. After AIMS, validate from the ExciView directory:
+h-BN producer. Keep the AIMS outputs in the run root's `aims/` subdirectory.
+An optional standalone check can be run from the ExciView directory:
 
 ```bash
 python -m tools.validate_conditional_producer /path/to/run
 ```
 
 This checks occupations, complex density, translated Bloch phases and source
-hashes; it writes `orbital_validation.json`. It does not independently prove
+hashes; it prints results without writing a report file. It does not independently prove
 that outputs from separate DFT runs share a band gauge.
 
 Menu 7 accepts a LibBSE run directory or an imported NPZ archive, a zero-based
-state index, the orbital directory, validation JSON and a new output directory.
+state index, the orbital directory and an output directory (new or existing).
+No validation report or manifest is required. The fixed-hole prompt is
+`Select fixed hole atom index (1-based; Enter to specify coordinates):`.
+An existing `conditional_density.npz` is replaced; other files are preserved.
 For a run directory, it also asks for the one-based band starts and imports the
 TDA amplitudes. Choose a one-based hole atom or enter Cartesian coordinates.
-The archive and validated producer files must remain available for hash checks.
+The BSE source files recorded in the archive must remain available for hash checks.
+Primitive orbitals and translated validation cubes are distinguished by their origins,
+without a manifest. Same-origin duplicate orbitals are rejected.
 Only native-gauge regular-grid LibBSE TDA is supported by this conditional path.
 
 The calculation interpolates complex hole orbitals with Bloch boundary phases,
 coherently sums the electron amplitudes, expands to the complete BvK supercell,
 and normalizes the electron-coordinate integral to one. The only final output is
 `conditional_density.npz`: density, cell and origin in Angstrom, atom positions
-and atomic numbers, hole position, state selection, and `summary_json` containing
-normalization checks and provenance hashes. Density is in Angstrom^-3.
+and atomic numbers, hole position, state selection, normalization checks and
+provenance hashes stored as native NPZ fields. No JSON strings are written. Density is in Angstrom^-3.
 Directory imports use a temporary exciton archive that is automatically removed.
 The calculator does not produce cube, JSON or image files; input preparation and
-the standalone validator still write their setup and validation files.
+the standalone validator do not write JSON records either.
 The optional `--save-wavefunction` flag for `python -m src.conditional_density`
 stores the normalized complex amplitude inside the same NPZ archive.
 Missing/ambiguous orbitals, incompatible grids, stale sources and invalid state

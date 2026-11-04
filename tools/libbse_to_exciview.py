@@ -5,7 +5,6 @@ State indices in ExciView are zero based; absolute band IDs are one based.
 """
 import argparse
 import hashlib
-import json
 from pathlib import Path
 import re
 
@@ -191,14 +190,17 @@ def convert(run_dir, output, v_start, c_start, spin='singlet', mulliken_dir=None
             directory, kpoints, range(v_start, c_start+nc))
         sources.extend(mulliken_files)
     provenance = {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
+    # Preserve the producer's gauge label; this import never rotates KS or BSE coefficients.
     gauge = params.get('wavefunction_gauge', ['auto'])[0]
     if gauge == 'auto' and params.get('input_format', ['auto'])[0] == 'fhi_aims':
         gauge = 'native'
+    # Paired path/hash arrays record input provenance without a separate manifest.
     np.savez(output, coefficients=amplitudes.reshape(-1,nk,nv,nc),
              energies_ha=energies/2, energies_ry=energies, kpoints=kpoints, kmesh=mesh,
              v_start=v_start, c_start=c_start,
              wavefunction_gauge=gauge,
-             source='LibBSE TDA', provenance=json.dumps(provenance), **mulliken)
+             source='LibBSE TDA', source_paths=list(provenance),
+             source_sha256=list(provenance.values()), **mulliken)
     return {'states': len(energies), 'dimension': nk*nv*nc, 'mpi_ranks': len(files),
             'mulliken_dir': str(directory) if directory is not None else None,
             'mulliken_kpoints': nk if mulliken else 0,
@@ -215,5 +217,7 @@ if __name__ == '__main__':
     parser.add_argument('--mulliken-dir', help='Directory containing original bandmlk*.out files; '
                         'otherwise detect local outputs or sibling DFT_muliken/DFT_mulliken/aims_mulliken_333')
     args = parser.parse_args()
-    print(json.dumps(convert(args.run_dir, args.output, args.v_start, args.c_start,
-                             args.spin, args.mulliken_dir), indent=2))
+    conversion_summary = convert(args.run_dir, args.output, args.v_start, args.c_start,
+                                 spin=args.spin, mulliken_dir=args.mulliken_dir)
+    for conversion_key, conversion_value in conversion_summary.items():
+        print(f'{conversion_key}: {conversion_value}')

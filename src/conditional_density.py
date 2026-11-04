@@ -8,7 +8,6 @@ import argparse
 import hashlib
 import itertools
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -117,38 +116,6 @@ class OrbitalCubes:
         return orbital_parts[0] + 1j * orbital_parts[1]
 
 
-def plot_slices(cond_density, cond_origin, cond_cell, hole_cartesian, output):
-    """Cartesian planes through the actual hole, masked outside the BvK box."""
-    os.environ.setdefault('MPLCONFIGDIR', '/tmp/libbse-cond-matplotlib')
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from scipy.ndimage import map_coordinates
-    bvk_corners = np.asarray(list(itertools.product((0, 1), repeat=3))) @ cond_cell + cond_origin
-    figure, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
-    for axis, (first, second, normal) in zip(axes, ((0, 1, 2), (0, 2, 1), (1, 2, 0))):
-        plane_x, plane_y = np.meshgrid(
-            np.linspace(bvk_corners[:, first].min(), bvk_corners[:, first].max(), 240),
-            np.linspace(bvk_corners[:, second].min(), bvk_corners[:, second].max(), 240))
-        plane_points = np.empty((*plane_x.shape, 3))
-        plane_points[..., first], plane_points[..., second] = plane_x, plane_y
-        plane_points[..., normal] = hole_cartesian[normal]
-        plane_fractional = (plane_points - cond_origin) @ np.linalg.inv(cond_cell)
-        plane_indices = plane_fractional * np.asarray(cond_density.shape)
-        plane_density = map_coordinates(cond_density, plane_indices.reshape(-1, 3).T,
-                                        order=1, mode='grid-wrap').reshape(plane_x.shape)
-        plane_inside = np.all((plane_fractional >= 0) & (plane_fractional < 1), axis=-1)
-        plane_density[~plane_inside] = np.nan
-        plane_image = axis.pcolormesh(plane_x-hole_cartesian[first], plane_y-hole_cartesian[second],
-                                     plane_density, shading='auto', cmap='magma',
-                                     vmin=0, vmax=float(cond_density.max()))
-        axis.plot(0, 0, 'c+', markersize=10)
-        axis.set(xlabel=f'{"xyz"[first]} - hole (Å)', ylabel=f'{"xyz"[second]} - hole (Å)', aspect='equal')
-    figure.colorbar(plane_image, ax=axes, label='Conditional electron density (Å⁻³)')
-    figure.savefig(output, dpi=180)
-    plt.close(figure)
-
-
 def select_hole(primitive_atoms, hole_coordinates=None, hole_atom=None):
     """Atom selection is point conditioning at the nucleus, not a band projection.
 
@@ -173,7 +140,6 @@ def select_hole(primitive_atoms, hole_coordinates=None, hole_atom=None):
 
 
 def calculate(args):
-    from ase.io.cube import write_cube
     if args.output.exists():
         raise ValueError('Output directory already exists; choose a new path to preserve previous results')
     orbital_validation = json.loads(args.validation.read_text())
@@ -252,27 +218,6 @@ def calculate(args):
     cond_cell = primitive_cell * exciton_mesh[:, None]
     cond_atoms = orbital_reader.reference['atoms'].repeat(tuple(exciton_mesh))
     cond_atoms.positions += bvk_start @ primitive_cell
-    args.output.mkdir(parents=True)
-    if getattr(args, 'save_wavefunction', False):
-        # Preserve the complex fixed-hole section of the exciton wavefunction,
-        # normalized over the same complete BvK domain as the density.
-        np.savez_compressed(args.output/'exciton_wavefunction.npz',
-                            amplitude=bvk_amplitude/np.sqrt(raw_integral),
-                            raw_integral=raw_integral,
-                            origin_angstrom=cond_origin, cell_angstrom=cond_cell,
-                            hole_angstrom=hole_cartesian, state=args.state,
-                            normalization='Integral over electron coordinate at the fixed hole equals one')
-    np.savez_compressed(args.output/'conditional_density.npz', density=cond_density,
-                        origin_angstrom=cond_origin, cell_angstrom=cond_cell,
-                        hole_angstrom=hole_cartesian, hole_orbital_values=hole_orbitals,
-                        kpoints=exciton_kpoints, atom_positions_angstrom=cond_atoms.positions,
-                        atom_numbers=cond_atoms.numbers, state=args.state,
-                        hole_selection_json=json.dumps(hole_selection))
-    with (args.output/'conditional_electron_density.cube').open('w') as cube_output:
-        write_cube(cube_output, cond_atoms, data=cond_density, origin=cond_origin,
-                   comment=f'Normalized conditional electron density; state {args.state}; values Angstrom^-3')
-    if not args.no_plot:
-        plot_slices(cond_density, cond_origin, cond_cell, hole_cartesian, args.output/'conditional_slices.png')
     cond_summary = dict(state=args.state, hole_angstrom=hole_cartesian.tolist(),
                         hole_selection=hole_selection,
                         hole_orbital_norm_squared=float(np.sum(abs(hole_orbitals)**2)),
@@ -287,9 +232,21 @@ def calculate(args):
                         validation_sha256=hashlib.sha256(args.validation.read_bytes()).hexdigest(),
                         script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                         orbital_sha256=orbital_reader.hashes,
+                        bse_source_hashes=exciton_provenance,
+                        producer_source_hashes=orbital_validation['source_hashes'],
                         gauge_evidence='User-supplied report; this run does not recompute AO-gauge compatibility',
                         limitations='Scalar TDA, complete Gamma-centered mesh, spin-1 cubes; no physical convergence claim')
-    (args.output/'summary.json').write_text(json.dumps(cond_summary, indent=2)+'\n')
+    cond_optional_arrays = {}
+    if getattr(args, 'save_wavefunction', False):
+        cond_optional_arrays['amplitude'] = bvk_amplitude / np.sqrt(raw_integral)
+    args.output.mkdir(parents=True)
+    np.savez_compressed(args.output/'conditional_density.npz', density=cond_density,
+                        origin_angstrom=cond_origin, cell_angstrom=cond_cell,
+                        hole_angstrom=hole_cartesian, hole_orbital_values=hole_orbitals,
+                        kpoints=exciton_kpoints, atom_positions_angstrom=cond_atoms.positions,
+                        atom_numbers=cond_atoms.numbers, state=args.state,
+                        hole_selection_json=json.dumps(hole_selection),
+                        summary_json=json.dumps(cond_summary), **cond_optional_arrays)
     print(f'Wrote {args.output}: integral={cond_summary["normalized_integral"]:.15g}, '
           f'Parseval error={cond_summary["parseval_relative_error"]:.3g}')
 
@@ -304,8 +261,8 @@ def main():
     hole_group.add_argument('--hole', type=float, nargs=3, help='Cartesian Angstrom coordinates')
     hole_group.add_argument('--hole-atom', type=int, help='One-based primitive atom index from orbital cube geometry')
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--no-plot', action='store_true')
-    parser.add_argument('--save-wavefunction', action='store_true', help='Also save the normalized complex fixed-hole exciton wavefunction')
+    parser.add_argument('--no-plot', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--save-wavefunction', action='store_true', help='Include normalized complex amplitude in the same conditional_density.npz')
     calculate(parser.parse_args())
 
 

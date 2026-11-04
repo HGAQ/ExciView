@@ -12,8 +12,8 @@ from ase import Atoms
 from ase.io import write
 from ase.io.cube import write_cube, read_cube
 import BSE_tools as b
-from tools.conditional_workflow import prepare_inputs
-from tools.conditional_density import calculate, hole_value, canonical_kpoints, OrbitalCubes
+from src.conditional_workflow import prepare_inputs
+from src.conditional_density import calculate, hole_value, canonical_kpoints, OrbitalCubes
 from tools.validate_conditional_producer import validate
 
 
@@ -80,10 +80,11 @@ class ConditionalWorkflowTests(unittest.TestCase):
         output=self.run/'menu7'
         answers=['7',str(self.run/'excitons.npz'),'0',str(self.aims),str(self.run/'orbital_validation.json'),str(output),'',*map(str,self.origin+[.01,.01,.01])]
         with patch('builtins.input',side_effect=answers),contextlib.redirect_stdout(io.StringIO()): b.main()
-        self.assertTrue((output/'conditional_electron_density.cube').exists())
+        self.assertEqual({path.name for path in output.iterdir()}, {'conditional_density.npz'})
         with np.load(output/'conditional_density.npz') as archive:
             calculated_density=archive['density']
             density_cell=archive['cell_angstrom']
+            cond_summary=json.loads(str(archive['summary_json']))
         expected_amplitudes=[]
         for translation in (-1,0):
             expected_amplitudes.append(sum(self.coefficients[0,k,0,0]*self.primitive_orbitals[k+1,1][0,0,0].conjugate()*self.primitive_orbitals[k+1,2]*np.exp(2j*np.pi*self.kpoints[k,0]*translation) for k in range(2)))
@@ -92,10 +93,7 @@ class ConditionalWorkflowTests(unittest.TestCase):
         expected_density/=expected_density.sum()*voxel_volume
         np.testing.assert_allclose(calculated_density,expected_density,rtol=1e-12,atol=1e-12)
         self.assertAlmostEqual(calculated_density.sum()*voxel_volume,1)
-        with (output/'conditional_electron_density.cube').open() as stream: cube_record=read_cube(stream)
-        np.testing.assert_allclose(cube_record['data'],calculated_density,rtol=5e-6)
-        summary=json.loads((output/'summary.json').read_text())
-        self.assertLess(summary['parseval_relative_error'],1e-12)
+        self.assertLess(cond_summary['parseval_relative_error'],1e-12)
 
     def test_phase_covariance(self):
         calculate(self.arguments('before'))

@@ -471,14 +471,14 @@ def workflow_analyze_bz():
 def workflow_generate_cond_inputs():
     print("\n--- PHASE 5: Generate Conditional Wavefunction Inputs ---")
     if not ASE_AVAILABLE: return print("[Error] ASE not installed.")
-    from tools.conditional_workflow import generate_inputs
+    from src.conditional_workflow import generate_inputs
     try: generate_inputs()
     except Exception as e: return print(f"Error: {e}")
 
 def workflow_analyze_cond():
     print("\n--- PHASE 6: Conditional Density Analysis ---")
     if not ASE_AVAILABLE: return print("[Error] ASE not installed.")
-    from tools.conditional_workflow import analyze_cond
+    from src.conditional_workflow import analyze_cond
     try: analyze_cond()
     except Exception as e: return print(f"Error: {e}")
 

@@ -1,11 +1,12 @@
 import json
 import hashlib
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 from ase.io import read
 
-from tools.conditional_density import calculate
+from src.conditional_density import calculate
 from tools.libbse_to_exciview import convert
 
 
@@ -85,11 +86,6 @@ def analyze_cond():
     if output.exists(): raise ValueError('Output directory already exists.')
     if fname.is_dir():
         v_start = int(input('Abs Valence ID: ')); c_start = int(input('Abs Conduction ID: '))
-        archive_path = output.parent/(output.name+'_excitons.npz')
-        if archive_path.exists(): raise ValueError('Imported archive already exists.')
-        output.parent.mkdir(parents=True, exist_ok=True)
-        convert(fname, archive_path, v_start, c_start)
-        fname = archive_path
     print('\n[Fixed Hole Position]')
     hole_atom_text = input('Hole atom (1-based, blank for coordinates): ').strip()
     hole_atom = int(hole_atom_text) if hole_atom_text else None
@@ -97,6 +93,27 @@ def analyze_cond():
     if hole_atom is None:
         hx = float(input('  x (Ang): ')); hy = float(input('  y (Ang): ')); hz = float(input('  z (Ang): '))
         hole_coordinates = [hx, hy, hz]
-    calculate(SimpleNamespace(excitons=fname, orbitals=orbitals, validation=validation,
-                             state=state_idx, hole=hole_coordinates, hole_atom=hole_atom,
-                             output=output, no_plot=True, save_wavefunction=False))
+    # Keep imported BSE amplitudes temporary; the final density is the only product.
+    with tempfile.TemporaryDirectory(prefix='exciview-import-') as cond_import_directory:
+        if fname.is_dir():
+            cond_archive_path = Path(cond_import_directory)/'excitons.npz'
+            convert(fname, cond_archive_path, v_start, c_start)
+        else:
+            cond_archive_path = fname
+        calculate(SimpleNamespace(excitons=cond_archive_path, orbitals=orbitals, validation=validation,
+                                 state=state_idx, hole=hole_coordinates, hole_atom=hole_atom,
+                                 output=output, save_wavefunction=False))
+
+
+def main():
+    print('ExciView: conditional-density NPZ preparation')
+    print('6. Generate conditional orbital inputs')
+    print('7. Calculate fixed-hole conditional_density.npz')
+    print('0. Exit')
+    cond_choice = input('Select Option: ').strip()
+    if cond_choice == '6':
+        generate_inputs()
+    elif cond_choice == '7':
+        analyze_cond()
+    elif cond_choice != '0':
+        raise ValueError('Select 6, 7 or 0')

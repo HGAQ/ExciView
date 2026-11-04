@@ -30,14 +30,14 @@ The tool operates via an interactive menu with four main analysis pipelines:
 ### 3. Brillouin Zone & Band Analysis
 *   **Phase 5 (Statistics):** Performs a pure statistical analysis of the BSE eigenvector to report the dominant $k$-points and the dominant band transitions (e.g., HOMO-1 $\to$ LUMO) responsible for the excitation.
 
-### 4. Conditional Density Pipeline (To be added)
+### 4. Conditional Density Pipeline
 *   **Phase 6 (Input Gen):** Generates input requests for raw `eigenstate` wavefunctions (preserving phase information) for relevant bands.
 *   **Phase 7 (Coherent Sum):** Asks for a fixed hole coordinate $\mathbf{r}_h$, extracts hole amplitudes, computes mixing coefficients, and constructs the conditional electron density $\rho_{cond}(\mathbf{r})$.
 
 ## 🛠 Roadmap / To-Do
 
 - [x] **Volumetric Plotting:** Generate `.cube` files for average hole/electron density visualization.
-- [ ] **Conditional Density:** Calculate electron density distribution for a fixed hole position.
+- [x] **Conditional Density:** Coherent complex-wavefunction summation with a fixed hole position (requires a compatible orbital cube producer).
 - [ ] **Molecular Analysis:** Support for finite systems (Molecules) covering LR-TDDFT, BSE, and full-frequency GW analysis.
 
 ## 📦 Requirements
@@ -48,3 +48,75 @@ The tool operates via an interactive menu with four main analysis pipelines:
 
 ## ✉️ Contact
 For questions or issues, please contact **Ruiyi Zhou** (ruiyi.zhou@phys.chem.ethz.ch) at ETH Zurich.
+
+## LibBSE integration
+
+`libbse_to_exciview.py` imports LibBSE **TDA, regular SCF-grid** calculations.
+It joins the contiguous electron–hole pair intervals in numeric MPI rank order,
+checks rank sizes and state norms, and stores `(state, k, v, c)` complex amplitudes,
+Hartree energies, actual k coordinates, band IDs, gauge, and source hashes in NPZ.
+It supports all TDA spin channels; full-BSE X/Y and fine-grid imports are not
+implemented. The existing ELSI input remains supported.
+
+```bash
+python -m pip install -r requirements.txt
+python tools/libbse_to_exciview.py /path/to/bse_run --v-start 11 --c-start 15 -o excitons.npz
+python BSE_tools.py
+```
+
+Enter `excitons.npz` at the filename prompt. **State Index is zero based** (0 is
+the lowest state); absolute band IDs and cube k-point IDs are one based.
+For Si 3×3×3 with bands 11–14 / 15–17, use Nv=4, Nc=3, Nk=27 and Kx=Ky=Kz=3.
+The archive's dimensions, band IDs and k coordinates are validated rather than
+inferred from filename order. Thresholds are percentages of BSE weight, not a
+requested cumulative accuracy. Threshold 0 requests the full band window.
+
+The LibBSE importer also reads original `bandmlk*.out` files containing multiple
+k points per band segment (for example, nine three-point segments for a 3×3×3
+mesh). No splitting or intermediate `mulliken_snippet.in` is needed. It searches,
+in order, the BSE run directory, `input_dir`, and sibling directories named
+`DFT_muliken`, `DFT_mulliken`, or `aims_mulliken_333`. For another location, pass
+`--mulliken-dir /path/to/mulliken_run` (relative paths are relative to the shell's
+working directory). With no detected directory the import remains amplitude-only.
+
+Each block is matched by its periodic k coordinates to the BSE grid, independently
+of path labels and file order. The full BSE k grid and requested band/atom coverage
+are required; repeated endpoints are accepted only if their populations agree.
+Missing points, nonfinite populations and conflicting duplicates fail the import.
+Total and angular-momentum populations and source hashes are embedded in NPZ.
+Menu 2 then only asks for the archive, state index, Nv, Nc and Nk; it uses the
+stored band IDs and populations automatically. Existing archives without Mulliken
+data and legacy ELSI files retain the snippet/file-pattern workflow. Re-import an
+existing BSE run to add Mulliken data to its archive. Matching coordinates does
+not align independently diagonalized degenerate orbitals; the physical band
+gauge consistency requirement still applies.
+
+All seven menu entries are enabled. Conditional input generation requests **both**
+`eigenstate` and `eigenstate_imag`; analysis forms
+`abs(sum_kvc A[k,v,c] * conj(psi[v,k](r_h)) * psi[c,k](r))**2`.
+Missing/ambiguous cubes, incompatible grids, origins or geometries cause an error.
+The output retains the original cube origin. The hole coordinate is in Angstrom
+and must lie inside the supplied cube: wrapping a Bloch orbital without its phase
+is not valid. The containing voxel is sampled (no interpolation). Conditional
+output is raw squared amplitude, not a unit-normalized conditional probability.
+Average density and Mulliken outputs are normalized over retained contributions;
+the captured weights/populations are printed in the logs.
+
+Complex orbital cubes must come from the **same native band gauge** as the BSE
+calculation. Densities alone cannot reconstruct these phases, and a separate
+SCF/band diagonalization can rotate degenerate orbitals. Some FHI-aims versions
+explicitly disable off-Gamma orbital cubes and have an imaginary-buffer bug;
+Phase 6 writes requests but cannot make an unsupported producer execute them.
+The local Si integration fixture includes a separately built scalar-relativistic
+producer repair and Bloch-translation tests. It does not enable general SOC cubes.
+
+Regression tests (all seven menus, independent analytic sums, gauge covariance,
+ELSI real/complex sparse I/O, malformed inputs and unequal MPI partitions):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Local complete Si fixture: `/work/users/l/s/lsr/LibBSE/1_LibBSE_test/17_post`.
+See its `README.md`, `verification.json`, `analysis/phase*.log`, and recorded
+producer patches for measured results and reproduction commands.
